@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Artificial horizon</title>
+<style>
+:root{--bg:#14181c;--panel:#1d2329;--ink:#e8edf1;--mute:#8d9aa6;--accent:#f2b705;--sky:#2f7fc1;--gnd:#7a4e2d;--err:#ff7b6b}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:"Trebuchet MS",Verdana,sans-serif;display:flex;align-items:center;justify-content:center;padding:16px}
+main{width:100%;max-width:460px}
+h1{font-size:1.3rem;margin:0 0 4px}
+p.sub{margin:0 0 18px;color:var(--mute);font-size:.9rem}
+.panel{background:var(--panel);border-radius:10px;padding:18px}
+.drop{display:block;margin-bottom:12px;padding:12px;border:1px dashed #44505b;border-radius:8px;cursor:pointer}
+.drop span{display:block;font-size:.85rem;color:var(--mute);margin-bottom:6px}
+.drop input{width:100%;color:var(--ink)}
+.drop.ok{border-style:solid;border-color:#4caf7a}
+#msg{min-height:1.2em;font-size:.85rem;color:var(--err);margin:0 0 12px}
+button{background:var(--accent);color:#1a1a1a;border:0;border-radius:6px;padding:9px 14px;font:inherit;font-weight:bold;cursor:pointer}
+button:disabled{opacity:.4;cursor:not-allowed}
+button.alt{background:#2c353d;color:var(--ink)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+#app{display:none}
+svg{width:100%;height:auto;display:block}
+.read{display:flex;justify-content:space-around;margin:14px 0;font-variant-numeric:tabular-nums}
+.read div{text-align:center;color:var(--mute);font-size:.8rem}
+.read b{display:block;color:var(--ink);font-size:1.5rem}
+.ctrl{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.ctrl label{margin-left:auto;font-size:.8rem;color:var(--mute);display:flex;gap:6px;align-items:center}
+#seek{width:100%;margin-top:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>Artificial horizon</h1>
+<p class="sub">Load one pitch file and one roll file. Each line is one angle in degrees.</p>
+
+<section id="setup" class="panel">
+  <label class="drop" id="dx"><span>Pitch file (X), degrees, nose up is positive</span><input type="file" id="fx" accept=".txt,.csv,text/plain"></label>
+  <label class="drop" id="dy"><span>Roll file (Y), degrees, right bank is positive</span><input type="file" id="fy" accept=".txt,.csv,text/plain"></label>
+  <p id="msg" role="alert"></p>
+  <button id="start" disabled>Show horizon</button>
+</section>
+
+<section id="app" class="panel">
+  <svg viewBox="-150 -150 300 300" aria-label="Artificial horizon">
+    <defs><clipPath id="clip"><circle r="140"/></clipPath></defs>
+    <g clip-path="url(#clip)">
+      <g id="roll">
+        <g id="pitch">
+          <rect x="-400" y="-800" width="800" height="800" fill="var(--sky)"/>
+          <rect x="-400" y="0" width="800" height="800" fill="var(--gnd)"/>
+          <line x1="-400" x2="400" y1="0" y2="0" stroke="#fff" stroke-width="2"/>
+          <g id="ladder" stroke="#fff" fill="#fff" font-size="9" text-anchor="middle"></g>
+        </g>
+      </g>
+    </g>
+    <circle r="140" fill="none" stroke="#0c0f12" stroke-width="12"/>
+    <g id="bank" stroke="#fff" stroke-width="2"></g>
+    <path id="ptr" d="M0,-126 l-7,-12 h14z" fill="var(--accent)"/>
+    <g stroke="var(--accent)" stroke-width="5" stroke-linecap="round" fill="none">
+      <path d="M-70,0 h40 v10"/><path d="M70,0 h-40 v10"/>
+    </g>
+    <circle r="4" fill="var(--accent)"/>
+  </svg>
+  <div class="read"><div>Pitch<b id="rp">0.0°</b></div><div>Roll<b id="rr">0.0°</b></div><div>Sample<b id="rs">1/1</b></div></div>
+  <div class="ctrl">
+    <button id="play">Play</button>
+    <button class="alt" id="step">Step</button>
+    <button class="alt" id="reset">Reset</button>
+    <button class="alt" id="newf">New files</button>
+    <label>Speed <input type="range" id="spd" min="1" max="60" value="15"> <span id="spv">15</span>/s</label>
+  </div>
+  <input type="range" id="seek" min="0" max="0" value="0" aria-label="Sample position">
+</section>
+</main>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const PX=2.6; // pixels per degree of pitch
+let X=null,Y=null,i=0,playing=false,last=0,acc=0;
+
+function parse(text,name){
+  const out=[];
+  text.split(/\r?\n/).forEach((l,n)=>{
+    l=l.trim(); if(!l) return;
+    const v=Number(l.replace(',', '.'));
+    if(!isFinite(v)) throw new Error(name+": line "+(n+1)+" is not a number ("+l.slice(0,20)+")");
+    out.push(v);
+  });
+  if(!out.length) throw new Error(name+" is empty");
+  return out;
+}
+function read(f){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=()=>rej(new Error("Cannot read "+f.name));r.readAsText(f);});}
+
+async function check(){
+  const msg=$("msg"); msg.textContent=""; $("start").disabled=true; X=Y=null;
+  $("dx").classList.remove("ok"); $("dy").classList.remove("ok");
+  try{
+    if($("fx").files[0]){X=parse(await read($("fx").files[0]),"Pitch file");$("dx").classList.add("ok");}
+    if($("fy").files[0]){Y=parse(await read($("fy").files[0]),"Roll file");$("dy").classList.add("ok");}
+    if(X&&Y&&X.length!==Y.length){
+      msg.textContent="The files have different lengths ("+X.length+" and "+Y.length+" lines). Playback will stop at the shorter one.";
+    }
+    $("start").disabled=!(X&&Y);
+  }catch(e){msg.textContent=e.message;X=Y=null;}
+}
+$("fx").onchange=check; $("fy").onchange=check;
+
+// static scale
+(function(){
+  const L=$("ladder");
+  for(let p=-30;p<=30;p+=5){
+    if(!p) continue;
+    const y=-p*PX, w=p%10===0?30:16;
+    let s='<line x1="'+(-w)+'" x2="'+w+'" y1="'+y+'" y2="'+y+'" stroke-width="1.5"/>';
+    if(p%10===0) s+='<text x="'+(w+12)+'" y="'+(y+3)+'" stroke="none">'+Math.abs(p)+'</text><text x="'+(-w-12)+'" y="'+(y+3)+'" stroke="none">'+Math.abs(p)+'</text>';
+    L.insertAdjacentHTML("beforeend",s);
+  }
+  const B=$("bank");
+  [-60,-45,-30,-20,-10,0,10,20,30,45,60].forEach(a=>{
+    const len=(a%30===0)?14:8, r=r0=>r0;
+    B.insertAdjacentHTML("beforeend",'<line x1="0" x2="0" y1="-134" y2="'+(-134+len)+'" transform="rotate('+a+')"/>');
+  });
+})();
+
+function draw(){
+  const p=X[i], r=Y[i];
+  $("pitch").setAttribute("transform","translate(0,"+(p*PX)+")");
+  $("roll").setAttribute("transform","rotate("+(-r)+")");
+  $("ptr").setAttribute("transform","rotate("+(-r)+")");
+  $("rp").textContent=p.toFixed(1)+"°";
+  $("rr").textContent=r.toFixed(1)+"°";
+  $("rs").textContent=(i+1)+"/"+N();
+  $("seek").value=i;
+}
+const N=()=>Math.min(X.length,Y.length);
+
+function tick(t){
+  if(!playing) return;
+  acc+=(t-last)/1000*Number($("spd").value); last=t;
+  while(acc>=1){acc-=1; if(i<N()-1) i++; else {setPlay(false);break;}}
+  draw(); if(playing) requestAnimationFrame(tick);
+}
+function setPlay(v){
+  playing=v; $("play").textContent=v?"Pause":"Play";
+  if(v){ if(i>=N()-1) i=0; last=performance.now(); acc=0; requestAnimationFrame(tick);}
+}
+$("start").onclick=()=>{
+  $("setup").style.display="none"; $("app").style.display="block";
+  i=0; $("seek").max=N()-1; draw();
+};
+$("play").onclick=()=>setPlay(!playing);
+$("step").onclick=()=>{setPlay(false); if(i<N()-1) i++; draw();};
+$("reset").onclick=()=>{setPlay(false); i=0; draw();};
+$("newf").onclick=()=>{setPlay(false); $("app").style.display="none"; $("setup").style.display="block";};
+$("seek").oninput=e=>{i=Number(e.target.value); draw();};
+$("spd").oninput=e=>{$("spv").textContent=e.target.value;};
+})();
+</script>
+</body>
+</html>
